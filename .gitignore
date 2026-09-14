@@ -1,0 +1,16 @@
+__pycache__/
+*.py[cod]
+.venv/
+*.egg-info/
+.pytest_cache/
+build/
+dist/
+release/
+.generated/
+.env
+.env.*
+*.blend
+*.blend1
+*.glb
+storybook_job_*.log
+.DS_Store

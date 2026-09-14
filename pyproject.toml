@@ -1,0 +1,43 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "photo-to-storybook"
+version = "1.0.0"
+description = "Local photo-guided storybook character generator for Blender"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT AND CC0-1.0"
+license-files = ["LICENSE", "ASSET_LICENSE.txt"]
+authors = [{name = "Photo to Storybook contributors"}]
+keywords = ["blender", "3d", "anime", "character", "storybook"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Environment :: Console",
+  "Intended Audience :: End Users/Desktop",
+  "Operating System :: OS Independent",
+  "Programming Language :: Python :: 3",
+  "Topic :: Multimedia :: Graphics :: 3D Modeling",
+]
+dependencies = []
+
+[project.urls]
+Homepage = "https://github.com/binaydhakal/photo-to-storybook"
+Documentation = "https://github.com/binaydhakal/photo-to-storybook#readme"
+Issues = "https://github.com/binaydhakal/photo-to-storybook/issues"
+
+[project.scripts]
+photo-to-storybook = "photo_to_storybook.cli:main"
+
+[project.optional-dependencies]
+dev = ["build>=1.2", "twine>=6", "pytest>=8"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+photo_to_storybook = ["resources/*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

@@ -1,0 +1,22 @@
+{
+  "body": "neutral",
+  "hair": "swept",
+  "sunglasses": "auto",
+  "beard": false,
+  "watch": false,
+  "head_scale": 1.25,
+  "eye_scale": 1.2,
+  "shirt_text": "",
+  "frame": "portrait",
+  "face_box": null,
+  "skin_color": null,
+  "hair_color": null,
+  "shirt_color": null,
+  "pants_color": null,
+  "seed": 87,
+  "render": true,
+  "glb": true,
+  "resolution": 1000,
+  "overwrite": false,
+  "name": null
+}

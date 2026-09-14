@@ -1,0 +1,6 @@
+include LICENSE ASSET_LICENSE.txt CHANGELOG.md CONTRIBUTING.md
+recursive-include src/photo_to_storybook/resources *
+recursive-include docs *.md
+recursive-include examples *.json
+recursive-include tools *.py
+recursive-include tests *.py

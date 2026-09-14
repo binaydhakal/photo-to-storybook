@@ -1,0 +1,891 @@
+"""Photo to Storybook 3D — standalone Blender character generator.
+
+Run this file in Blender's Text Editor to show the Storybook panel in the
+3D View sidebar (N). Or use:
+  blender --background --factory-startup --python photo_to_storybook.py -- \
+      --image /path/photo.jpg --output /path/results
+
+Works locally, without an API key or uploading the photograph. Uses a
+parametric anatomical template, not photogrammetry or a trained 3D generator.
+The photo guides palette and face aspect; hair, garments, body and pose remain
+preset-based. See the accompanying README for honest limits and controls.
+
+Embedded MakeHuman asset data: CC0 1.0, MakeHuman Community.
+https://github.com/makehumancommunity/makehuman/blob/master/LICENSE.ASSETS.md
+Script code: MIT license. No affiliation with Studio Ghibli.
+"""
+bl_info = {'name':'Photo to Storybook 3D','author':'Photo to Storybook contributors','version':(1,0,0),
+ 'blender':(4,2,0),'location':'3D View > Sidebar > Storybook',
+ 'description':'Photo-guided, editable storybook/anime character generator','category':'Object'}
+import bpy, math, json, random, pathlib, bmesh, sys, argparse, subprocess
+import base64, zlib, zipfile, io, tempfile, hashlib, os, time
+import numpy as np
+from mathutils import Vector, Matrix
+from mathutils.bvhtree import BVHTree
+from math import sin, cos, pi, exp
+from bpy.props import StringProperty, EnumProperty, BoolProperty, FloatProperty, FloatVectorProperty
+
+DEFAULTS={'body':'neutral','hair':'swept','sunglasses':'auto','beard':False,
+ 'watch':False,'head_scale':1.20,'eye_scale':1.15,'shirt_text':'',
+ 'frame':'portrait','face_box':None,'seed':87,'render':True,'glb':True,
+ 'resolution':1000,'overwrite':False,'name':None,'skin_color':None,
+ 'hair_color':None,'shirt_color':None,'pants_color':None}
+
+# The payload at the end of this script contains the CC0 base mesh, morphs,
+# anatomical weights, skeleton, and license. No runtime downloads are made.
+ASSET_PAYLOAD = '__ASSET_PAYLOAD__'
+VISION_SOURCE = '__VISION_SOURCE__'
+
+def cache_assets():
+ key=hashlib.sha256(ASSET_PAYLOAD.encode()).hexdigest()[:12]
+ folder=pathlib.Path(tempfile.gettempdir())/('storybook3d_'+key)
+ folder.mkdir(parents=True,exist_ok=True)
+ if not (folder/'base.obj').exists():
+  raw=zlib.decompress(base64.b85decode(ASSET_PAYLOAD))
+  with zipfile.ZipFile(io.BytesIO(raw)) as archive:
+   for entry in archive.infolist():
+    name=pathlib.Path(entry.filename)
+    if name.name!=entry.filename:raise RuntimeError('Invalid embedded asset path')
+    (folder/name.name).write_bytes(archive.read(entry))
+ return folder
+
+def linear(rgb):
+ return [((c+.055)/1.055)**2.4 if c>.04045 else c/12.92 for c in rgb]
+
+def morphs(cfg):
+ # These are fixed template construction weights, not inferred identities.
+ femininity={'masculine':0.,'neutral':.5,'feminine':1.}[cfg['body']]
+ out=[]
+ for gender,w in [('male',1-femininity),('female',femininity)]:
+  for template,tw in [('asian',.4),('caucasian',.6)]:
+   if w:out.append((template+'-'+gender+'-young',w*tw))
+ return out+[('head-fat-incr',.23),('head-square',.04),('mouth-angles-up',.36)]
+
+def detect_face(path,cache):
+ """Return normalized [left,top,width,height]. Largest face wins explicitly."""
+ notes=[]
+ if sys.platform=='darwin' and pathlib.Path('/usr/bin/swift').exists():
+  try:
+   src=cache/'face_detector.swift';src.write_text(VISION_SOURCE)
+   # Apple Vision is local. The timeout also covers first-run Swift startup.
+   run=subprocess.run(['/usr/bin/swift',str(src),str(path)],capture_output=True,text=True,timeout=90)
+   for line in reversed(run.stdout.splitlines()):
+    try:
+     data=json.loads(line)
+     if data.get('bbox'):
+      data['method']='Apple Vision (local)';return data,notes
+    except (ValueError,TypeError):pass
+   notes.append('Apple Vision did not find a face; using framing controls.')
+  except (OSError,subprocess.TimeoutExpired):notes.append('Local face detector unavailable; using framing controls.')
+ # Optional OpenCV if the user already installed it in Blender's Python.
+ try:
+  import cv2
+  image=cv2.imread(str(path));gray=cv2.cvtColor(image,cv2.COLOR_BGR2GRAY)
+  detector=cv2.CascadeClassifier(cv2.data.haarcascades+'haarcascade_frontalface_default.xml')
+  boxes=detector.detectMultiScale(gray,1.1,5)
+  if len(boxes):
+   x,y,w,h=max(boxes,key=lambda b:b[2]*b[3]);ih,iw=gray.shape
+   return {'bbox':[float(x/iw),float(y/ih),float(w/iw),float(h/ih)],'faces':len(boxes),'method':'OpenCV (local)'},notes
+ except (ImportError,AttributeError,ValueError):pass
+ except Exception as exc:notes.append('Optional OpenCV detector could not analyze this file: '+type(exc).__name__)
+ return {},notes
+
+def analyze_photo(path,cfg,cache):
+ image=bpy.data.images.load(str(path),check_existing=False)
+ width,height=map(int,image.size)
+ if width==0 or height==0:raise ValueError('Cannot read this image. Use a supported PNG, JPEG, or WebP file.')
+ if width<32 or height<32:raise ValueError('Use an image at least 32 × 32 pixels.')
+ arr=np.empty(width*height*4,dtype=np.float32);image.pixels.foreach_get(arr)
+ arr=arr.reshape(height,width,4)[::-1,:,:3].copy()
+ # Keep analysis inexpensive for high-resolution photographs.
+ step=max(1,max(width,height)//1200);arr=arr[::step,::step];hh,ww=arr.shape[:2]
+ detector,notes=detect_face(path,cache) if cfg['face_box'] is None else ({},[])
+ if cfg['face_box'] is not None:
+  box=cfg['face_box'];method='Manual face box'
+ elif detector.get('bbox'):
+  box=detector['bbox'];method=detector['method']
+ else:
+  box=[.32,.12,.36,.40] if cfg['frame']=='portrait' else [.40,.05,.20,.18]
+  method='Framing fallback';notes.append('Face was not detected. Correct face_box and colors if the draft looks wrong.')
+ x,y,w,h=box
+ if not (0<=x<1 and 0<=y<1 and w>0 and h>0 and x+w<=1.001 and y+h<=1.001):
+  raise ValueError('face_box must be normalized [left, top, width, height] inside the image.')
+ def region(a,b,c,d):
+  a,b,c,d=max(0,a),max(0,b),min(1,c),min(1,d)
+  if c<=a or d<=b:return np.empty((0,3))
+  return arr[int(b*hh):max(int(b*hh)+1,int(d*hh)),int(a*ww):max(int(a*ww)+1,int(c*ww)),:].reshape(-1,3)
+ def median(pixels,default,quantiles=(.15,.85)):
+  if len(pixels)<12:return default
+  lum=pixels@np.array([.2126,.7152,.0722]);lo,hi=np.quantile(lum,quantiles);p=pixels[(lum>=lo)&(lum<=hi)]
+  return np.median(p,axis=0).clip(.015,.97).tolist() if len(p) else default
+ # Cheek samples avoid most eyes, lips and the background; this remains a heuristic.
+ cheeks=np.concatenate([region(x+w*.13,y+h*.42,x+w*.34,y+h*.69),region(x+w*.66,y+h*.42,x+w*.87,y+h*.69)])
+ skin=median(cheeks,[.67,.43,.30],(.35,.85))
+ hair=median(region(x-w*.08,y-h*.65,x+w*1.08,y+h*.03),[.12,.075,.04],(.04,.4))
+ shirt=median(region(x+w*.08,y+h*1.45,x+w*.92,y+h*3.0),[.25,.43,.40],(.08,.55))
+ pants=median(region(x-w*.05,y+h*4.3,x+w*1.05,y+h*5.8),[.38,.51,.62],(.20,.75))
+ eyes=region(x+w*.10,y+h*.13,x+w*.90,y+h*.37)
+ eye_lum=float(np.median(eyes@np.array([.2126,.7152,.0722]))) if len(eyes) else .5
+ skin_lum=float(np.dot(skin,[.2126,.7152,.0722]));auto_glasses=eye_lum<skin_lum*.50
+ for key,value in [('skin_color',skin),('hair_color',hair),('shirt_color',shirt),('pants_color',pants)]:
+  # JSON and UI colors use familiar sRGB values, converted for Blender materials.
+  cfg[key]=linear(cfg[key] if cfg[key] is not None else value)
+ cfg['sunglasses']=auto_glasses if cfg['sunglasses']=='auto' else cfg['sunglasses']=='on'
+ cfg['face_width']=float(np.clip((w*width)/(h*height),.72,1.15))
+ if detector.get('faces',0)>1:notes.append('Multiple faces found; the largest face was used. Use face_box to choose a different person.')
+ bpy.data.images.remove(image)
+ return {'face_box':box,'face_method':method,'detected_faces':detector.get('faces',0),
+  'notes':notes,'sampled_srgb':{'skin':skin,'hair':hair,'shirt':shirt,'pants':pants},
+  'automatic_sunglasses':auto_glasses,'source_size':[width,height]}
+
+def validate_config(cfg):
+ allowed={'body':['neutral','masculine','feminine'],'hair':['swept','bob','long','bald'],
+          'sunglasses':['auto','on','off'],'frame':['portrait','full-body']}
+ for key,values in allowed.items():
+  if cfg[key] not in values:raise ValueError(key+' must be one of '+', '.join(values))
+ for key,lo,hi in [('head_scale',1.,1.5),('eye_scale',.8,1.7),('resolution',256,2048)]:
+  if not lo<=float(cfg[key])<=hi:raise ValueError(f'{key} must be between {lo} and {hi}')
+ for key in ['skin_color','hair_color','shirt_color','pants_color']:
+  c=cfg[key]
+  if c is not None and (len(c)!=3 or any(not 0<=float(v)<=1 for v in c)):raise ValueError(key+' must contain three sRGB numbers between 0 and 1')
+ if cfg['face_box'] is not None and len(cfg['face_box'])!=4:raise ValueError('face_box needs four numbers')
+ if cfg['name'] and (pathlib.Path(cfg['name']).name!=cfg['name'] or cfg['name'] in ['.','..']):raise ValueError('name must be a filename, without folders')
+
+def build_character(CFG,ANALYSIS,IMAGE,OUT,MH):
+ random.seed(int(CFG['seed']))
+ ROOT=OUT
+
+ bpy.ops.object.select_all(action='SELECT');bpy.ops.object.delete(use_global=False)
+ for c in list(bpy.data.collections):
+  if c.name!='Collection':bpy.data.collections.remove(c)
+ main=bpy.data.collections.get('Collection');main.name='CHARACTER • Storybook'
+ def coll(n):
+  c=bpy.data.collections.new(n);bpy.context.scene.collection.children.link(c);return c
+ stage=coll('STUDIO • cameras and lights');details=coll('DETAILS • garment stitching and print');haircoll=coll('HAIR • scalp and swept strands');source=coll('SOURCE • reference and notes')
+ def move(o,c):
+  for a in list(o.users_collection):a.objects.unlink(o)
+  c.objects.link(o)
+ def mat(n,col,rough=.5,metal=0):
+  m=bpy.data.materials.new(n);m.diffuse_color=(*col,1);m.use_nodes=True;p=m.node_tree.nodes.get('Principled BSDF');p.inputs['Base Color'].default_value=(*col,1);p.inputs['Roughness'].default_value=rough;p.inputs['Metallic'].default_value=metal;return m
+ skin=mat('Skin • warm medium tan',(.40,.205,.125),.5)
+ p=skin.node_tree.nodes.get('Principled BSDF');p.inputs['Subsurface Weight'].default_value=.08;p.inputs['Subsurface Radius'].default_value=(1,.45,.25)
+ cloth=mat('T-shirt • washed charcoal cotton',(.018,.02,.028),.87)
+ denim=mat('Jeans • faded light indigo denim',(.24,.38,.53),.83)
+ hairmat=mat('Hair • dark espresso',(.009,.004,.002),.72)
+ hairlight=mat('Hair • warm brown highlights',(.026,.010,.004),.64)
+ beardmat=mat('Beard • short dark brown',(.042,.021,.013),.66)
+ metal=mat('Aviators • warm silver metal',(.58,.52,.4),.23,.85)
+ lens=mat('Aviators • smoky blue reflective lenses',(.022,.041,.059),.16,.35)
+ black=mat('Watch • black resin',(.016,.018,.024),.48)
+ seammat=mat('Jeans • pale gold seam thread',(.37,.32,.21),.83)
+ solemat=mat('Sneakers • warm off-white rubber',(.66,.64,.56),.68)
+ shoemat=mat('Sneakers • charcoal canvas',(.038,.043,.054),.8)
+ def noise_material(m,scale,amount,distance,col1=None,col2=None):
+  nt=m.node_tree;p=nt.nodes.get('Principled BSDF');tex=nt.nodes.new('ShaderNodeTexNoise');tex.inputs['Scale'].default_value=scale;tex.inputs['Detail'].default_value=3
+  b=nt.nodes.new('ShaderNodeBump');b.inputs['Strength'].default_value=amount;b.inputs['Distance'].default_value=distance;nt.links.new(tex.outputs['Fac'],b.inputs['Height']);nt.links.new(b.outputs['Normal'],p.inputs['Normal'])
+  if col1:
+   ramp=nt.nodes.new('ShaderNodeValToRGB');ramp.color_ramp.elements[0].position=.2;ramp.color_ramp.elements[0].color=(*col1,1);ramp.color_ramp.elements[1].position=.8;ramp.color_ramp.elements[1].color=(*col2,1);nt.links.new(tex.outputs['Fac'],ramp.inputs[0]);nt.links.new(ramp.outputs[0],p.inputs['Base Color'])
+ noise_material(skin,175,.03,.0002)
+ noise_material(cloth,135,.18,.00065,(.006,.007,.01),(.016,.018,.025))
+ noise_material(denim,210,.22,.00065,(.16,.27,.39),(.28,.41,.55))
+ def mesh(n,vs,fs,ma=None,c=main):
+  me=bpy.data.meshes.new(n);me.from_pydata(vs,[],fs);me.update();o=bpy.data.objects.new(n,me);c.objects.link(o)
+  if ma:o.data.materials.append(ma)
+  for p in me.polygons:p.use_smooth=True
+  return o
+ def sub(o,n=1):
+  m=o.modifiers.new('Editable subdivision','SUBSURF');m.levels=n;m.render_levels=n
+  return m
+ def solid(o,t=.002):
+  m=o.modifiers.new('Fabric thickness','SOLIDIFY');m.thickness=t;m.offset=-1;return m
+ def apply(o,m):
+  bpy.context.view_layer.objects.active=o;o.select_set(True);bpy.ops.object.modifier_apply(modifier=m.name);o.select_set(False)
+ def curve(n,points,r,ma,c=details,cyclic=False):
+  cu=bpy.data.curves.new(n,'CURVE');cu.dimensions='3D';cu.resolution_u=12;cu.bevel_depth=r;cu.bevel_resolution=2
+  sp=cu.splines.new('BEZIER');sp.bezier_points.add(len(points)-1)
+  for p,co in zip(sp.bezier_points,points):p.co=co;p.handle_left_type='AUTO';p.handle_right_type='AUTO'
+  sp.use_cyclic_u=cyclic;o=bpy.data.objects.new(n,cu);c.objects.link(o);o.data.materials.append(ma);return o
+ def uvball(n,loc,scale,ma,c=main):
+  bpy.ops.mesh.primitive_uv_sphere_add(segments=32,ring_count=20,location=loc);o=bpy.context.object;o.name=n;o.scale=scale;bpy.ops.object.transform_apply(location=False,rotation=False,scale=True);move(o,c);o.data.materials.append(ma)
+  for p in o.data.polygons:p.use_smooth=True
+  return o
+ def cube(n,loc,scale,ma,bevel=.01,c=main):
+  bpy.ops.mesh.primitive_cube_add(size=1,location=loc);o=bpy.context.object;o.name=n;o.scale=scale;bpy.ops.object.transform_apply(location=False,rotation=False,scale=True);move(o,c);o.data.materials.append(ma)
+  if bevel:
+   m=o.modifiers.new('Soft manufactured edges','BEVEL');m.width=bevel;m.segments=3
+   m=o.modifiers.new('Corner normals','WEIGHTED_NORMAL')
+  return o
+ # MakeHuman CC0 anatomical topology; retain source indexing for skeleton and weights.
+ v=[];uv=[];faces={};fu={};g=''
+ for l in open(MH/'base.obj'):
+  a=l.split()
+  if not a:continue
+  if a[0]=='v':v.append(Vector(tuple(map(float,a[1:]))))
+  elif a[0]=='vt':uv.append(tuple(map(float,a[1:3])))
+  elif a[0]=='g':g=a[1]
+  elif a[0]=='f':
+   faces.setdefault(g,[]).append([int(b.split('/')[0])-1 for b in a[1:]])
+   fu.setdefault(g,[]).append([int(b.split('/')[1])-1 for b in a[1:]])
+ for n,w in morphs(CFG):
+  for l in open(MH/(n+'.target')):
+   a=l.split()
+   if a and not a[0].startswith('#'):v[int(a[0])]+=Vector(tuple(map(float,a[1:4])))*w
+ bottom=min(p.y for p in v);scale=1.76/(max(p.y for p in v)-bottom)
+ v=[Vector((p.x*scale,-p.z*scale,(p.y-bottom)*scale)) for p in v]
+ J=json.load(open(MH/'default.mhskel'));W=json.load(open(MH/'default_weights.mhw'))['weights']
+ def jt(n):
+  ids=J['joints'][n];return sum((v[a] for a in ids),Vector())/len(ids)
+ # Full source rig, used to create the reference pose. Retained for further editing.
+ arm=bpy.data.armatures.new('Reference pose skeleton');rig=bpy.data.objects.new('Pose rig • anatomical base',arm);source.objects.link(rig);bpy.context.view_layer.objects.active=rig;rig.select_set(True);bpy.ops.object.mode_set(mode='EDIT')
+ for n,b in J['bones'].items():
+  eb=arm.edit_bones.new(n);eb.head=jt(b['head']);eb.tail=jt(b['tail'])
+  if (eb.tail-eb.head).length<.0001:eb.tail.z+=.005
+ for n,b in J['bones'].items():
+  if b['parent']:arm.edit_bones[n].parent=arm.edit_bones[b['parent']]
+ bpy.ops.object.mode_set(mode='OBJECT');rig.select_set(False)
+ def fromgroup(group,name,ma):
+  ids=sorted(set(i for f in faces[group] for i in f));mapping={a:i for i,a in enumerate(ids)};o=mesh(name,[v[i] for i in ids],[[mapping[a] for a in f] for f in faces[group]],ma)
+  layer=o.data.uv_layers.new(name='Base UV')
+  for p,uf in zip(o.data.polygons,fu[group]):
+   for li,u in zip(p.loop_indices,uf):layer.data[li].uv=uv[u]
+  for n,weights in W.items():
+   selected=[(mapping[i],w) for i,w in weights if i in mapping]
+   if selected:
+    vg=o.vertex_groups.new(name=n)
+    for i,w in selected:vg.add([i],w,'REPLACE')
+  return o
+ body=fromgroup('body','Body • anatomical quad mesh',skin)
+ helper=fromgroup('helper-tights','Fitting surface',cloth)
+ # Pose both arms: elbows relaxed outside torso, hands turning into pockets.
+ def turn_chain(n,end,target):
+  bpy.context.view_layer.update();pb=rig.pose.bones[n];pivot=pb.head.copy();old=rig.pose.bones[end].head-pivot;new=Vector(target)-pivot
+  q=old.rotation_difference(new);pb.matrix=Matrix.Translation(pivot)@q.to_matrix().to_4x4()@Matrix.Translation(-pivot)@pb.matrix;bpy.context.view_layer.update()
+ for side,s in [('L',1),('R',-1)]:
+  turn_chain('upperarm01.'+side,'lowerarm01.'+side,(s*.264,-.014,1.162))
+  turn_chain('lowerarm01.'+side,'wrist.'+side,(s*.196,-.070,.943))
+  turn_chain('wrist.'+side,'finger3-1.'+side,(s*.18,.028,.835))
+  # Curl the fingers, leaving the palm and thumb at the pocket opening.
+  for n,pb in rig.pose.bones.items():
+   if n.startswith('finger') and n.endswith('.'+side):
+    pb.rotation_mode='XYZ';pb.rotation_euler.x=.20 if '1-' not in n else .12
+ bpy.context.view_layer.update()
+ for o in [body,helper]:
+  m=o.modifiers.new('Reference hands-in-pockets pose','ARMATURE');m.object=rig;apply(o,m)
+ for vert in body.data.vertices:
+  if vert.co.z>1.505:
+   f=min(1,(vert.co.z-1.505)/.04);vert.co.x*=1+.13*f
+ # Sink the concealed palms and fingers into the trouser pockets.
+ handgroups={g.index for g in body.vertex_groups if g.name.startswith(('wrist','finger','metacarpal'))}
+ for vert in body.data.vertices:
+  w=sum(g.weight for g in vert.groups if g.group in handgroups)
+  f=min(1,max(0,(.957-vert.co.z)/.025))*min(1,w)
+  vert.co.x-=math.copysign(.030*f,vert.co.x);vert.co.y+=.04*f
+ body.data.update()
+ # Static posed mesh stays editable. Source rig retained but hidden from export.
+ rig.hide_render=True;rig.hide_set(True)
+ # Store posed joint locations for fitted accessories.
+ posed={n: {'head':list(pb.head),'tail':list(pb.tail)} for n,pb in rig.pose.bones.items()}
+ # Construction measurements stay in memory.
+ # Smooth clothing surfaces derived from helper topology with exact cut boundaries.
+ def cut(o,co,normal,clear_inner=False,clear_outer=False):
+  bm=bmesh.new();bm.from_mesh(o.data);bmesh.ops.bisect_plane(bm,geom=list(bm.verts)+list(bm.edges)+list(bm.faces),dist=.00001,plane_co=co,plane_no=normal,clear_inner=clear_inner,clear_outer=clear_outer);bm.to_mesh(o.data);bm.free()
+ def duplicate(o,n,ma):
+  q=o.copy();q.data=o.data.copy();q.name=n;main.objects.link(q);q.data.materials.clear();q.data.materials.append(ma);return q
+ shirt=duplicate(helper,'T-shirt • loose washed cotton',cloth)
+ cut(shirt,(0,0,1.015),(0,0,1),clear_inner=True)
+ cut(shirt,(0,0,1.505),(0,0,1),clear_outer=True)
+ # Sleeve cut below bicep; cross-section of the already lowered arms.
+ # Remove remaining helper hands/forearms below the sleeve when outside torso.
+ bm=bmesh.new();bm.from_mesh(shirt.data)
+ remove=[f for f in bm.faces if abs(f.calc_center_median().x)>.204 and f.calc_center_median().z<1.205]
+ bmesh.ops.delete(bm,geom=remove,context='FACES')
+ seen=set();parts=[]
+ for vert in bm.verts:
+  if vert in seen:continue
+  stack=[vert];part=set()
+  while stack:
+   q=stack.pop()
+   if q in part:continue
+   part.add(q);seen.add(q);stack.extend(e.other_vert(q) for e in q.link_edges if e.other_vert(q) not in part)
+  parts.append(part)
+ keep=max(parts,key=len);bmesh.ops.delete(bm,geom=[q for q in bm.verts if q not in keep],context='VERTS')
+ bm.to_mesh(shirt.data);bm.free()
+ for p in shirt.data.vertices:
+  x,y,z=p.co
+  if abs(x)<.205:
+   f=min(1,max(0,(1.46-z)/.08));p.co.x*=1+.15*f
+   p.co.y+=(-1 if y<-.015 else 1)*(.004+.027*f)
+   p.co.y+=.0035*sin(x*83+z*55)*sin(z*24)
+  else:
+   p.co.x+=math.copysign(.022,x);p.co.y+=(-1 if y<-.025 else 1)*.022
+ shirt.data.update()
+ sm=shirt.modifiers.new('Relax drape','SMOOTH');sm.factor=.7;sm.iterations=4;apply(shirt,sm)
+ sub(shirt,2);solid(shirt,.0025)
+ jeans=duplicate(helper,'Jeans • straight fit with pocket openings',denim)
+ cut(jeans,(0,0,1.04),(0,0,1),clear_outer=True);cut(jeans,(0,0,.105),(0,0,1),clear_inner=True)
+ # Remove disconnected arm/hand helper parts above the hip.
+ bm=bmesh.new();bm.from_mesh(jeans.data);bad=[f for f in bm.faces if abs(f.calc_center_median().x)>.255];bmesh.ops.delete(bm,geom=bad,context='FACES');# Only the connected trousers component survives; cut-off forearm helpers are discarded.
+ seen=set();components=[]
+ for vert in bm.verts:
+  if vert in seen:continue
+  stack=[vert];part=set()
+  while stack:
+   q=stack.pop()
+   if q in part:continue
+   part.add(q);seen.add(q)
+   stack.extend(e.other_vert(q) for e in q.link_edges if e.other_vert(q) not in part)
+  components.append(part)
+ keep=max(components,key=len)
+ bmesh.ops.delete(bm,geom=[q for q in bm.verts if q not in keep],context='VERTS')
+ bm.to_mesh(jeans.data);bm.free()
+ for p in jeans.data.vertices:
+  x,y,z=p.co
+  cx=math.copysign(.11+.072*max(0,(.9-z))/.8,x)
+  if z<.85:
+   p.co.x=cx+(x-cx)*1.15;p.co.y=y*1.14
+  p.co.x+=math.copysign(.007,x);p.co.y+=(-1 if y<0 else 1)*.014
+  # Low-amplitude gathered folds around knees and cuffs.
+  fold=.0045*sin(88*z+10*x)*exp(-((z-.5)/.10)**2)+.005*sin(112*z+20*x)*exp(-((z-.15)/.09)**2)
+  p.co.y+=fold
+ sub(jeans,2);solid(jeans,.0028)
+ bpy.data.objects.remove(helper,do_unlink=True)
+ sub(body,1)
+ # Geometry is stored in meters; front faces -Y.
+ def bvh_of(o):
+  dg=bpy.context.evaluated_depsgraph_get();ev=o.evaluated_get(dg);me=ev.to_mesh();tree=BVHTree.FromPolygons([p.co for p in me.vertices],[list(p.vertices) for p in me.polygons]);ev.to_mesh_clear();return tree
+ bodybvh=bvh_of(body)
+ shirtbvh=bvh_of(shirt)
+ jeansbvh=bvh_of(jeans)
+ def front(tree,x,z,offset=.001):
+  h=tree.ray_cast(Vector((x,-1,z)),Vector((0,1,0)))
+  if h[0] is None and tree==jeansbvh:
+   for k in range(1,20):
+    xx=x*(1-k*.025);h=tree.ray_cast(Vector((xx,-1,z)),Vector((0,1,0)))
+    if h[0]:return h[0]+Vector((0,-offset,0))
+  return Vector((x,h[0].y-offset,z)) if h[0] else Vector((x,-.12,z))
+ def back(tree,x,z,offset=.001):
+  h=tree.ray_cast(Vector((x,1,z)),Vector((0,-1,0)))
+  return Vector((x,h[0].y+offset,z)) if h[0] else Vector((x,.13,z))
+ # Round knit collar follows the cut edge.
+ def boundaryloops(o):
+  counts={}
+  for p in o.data.polygons:
+   for a,b in p.edge_keys:counts[(min(a,b),max(a,b))]=counts.get((min(a,b),max(a,b)),0)+1
+  adj={}
+  for (a,b),n in counts.items():
+   if n==1:adj.setdefault(a,[]).append(b);adj.setdefault(b,[]).append(a)
+  loops=[];seen=set()
+  for a in adj:
+   if a in seen:continue
+   path=[];cur=a;prev=-1
+   while cur not in seen:
+    seen.add(cur);path.append(cur);opts=[x for x in adj[cur] if x!=prev]
+    if not opts:break
+    prev,cur=cur,opts[0]
+   if len(path)>3:loops.append([o.data.vertices[i].co.copy() for i in path])
+  return loops
+ for pts in boundaryloops(shirt):
+  z=sum(p.z for p in pts)/len(pts)
+  if z>1.46:curve('T-shirt • ribbed collar',pts,.0045,cloth,cyclic=True)
+  elif z<1.055:curve('T-shirt • hem stitch',pts,.001,cloth,cyclic=True)
+  else:curve('T-shirt • sleeve hem',pts,.0017,cloth,cyclic=True)
+ # Pockets: seams and pocket bags; hands terminate behind the pocket panels.
+ for side,s in [('L',1),('R',-1)]:
+  pts=[front(jeansbvh,s*x,z,.002) for x,z in [(.108,1.018),(.127,.992),(.145,.966),(.171,.942),(.19,.917)]]
+  curve('Jeans • '+side+' pocket piping',pts,.0027,denim)
+  curve('Jeans • '+side+' pocket topstitch',[p+Vector((-.004*s,-.001,-.002)) for p in pts],.00065,seammat)
+  # Long side seam.
+  pts=[front(jeansbvh,s*(.199+.025*(.9-z)),z,.0015) for z in [.90,.82,.7,.57,.46,.32,.20,.12]]
+  curve('Jeans • '+side+' outside seam',pts,.0008,seammat)
+  # Rear patch pockets.
+  coords=[(s*.066,.95),(s*.153,.95),(s*.166,.851),(s*.112,.831),(s*.065,.857)]
+  pts=[back(jeansbvh,x,z,.002) for x,z in coords];o=mesh('Jeans • '+side+' back pocket panel',pts,[list(range(5))],denim,details);solid(o,.001)
+  curve('Jeans • '+side+' back pocket stitching',pts,.0007,seammat,cyclic=True)
+ for x in [-.155,-.075,.075,.155]:
+  pts=[front(jeansbvh,x,z,.003) for z in [1.005,1.019,1.033]];curve('Jeans • belt loop',pts,.0035,denim)
+ curve('Jeans • fly seam',[front(jeansbvh,x,z,.002) for x,z in [(0,1.01),(.005,.967),(.014,.915),(.006,.88)]],.0009,seammat)
+ button=uvball('Jeans • metal waist button',front(jeansbvh,.012,1.024,.005),(.006,.002,.006),metal,details)
+ # Aviators: large softened teardrop lenses, thin double bridge, temples.
+ # Read actual face dimensions at the reference eye level.
+ eyez=1.640
+ # Face surface sampled for accessory placement.
+ for s in [-1,1]:
+  xc=s*.039;pts=[]
+  # Slightly squared upper edge, dropping lower toward the outside.
+  for i in range(64):
+   t=2*pi*i/64;dx=.034*cos(t);dz=.027*sin(t)
+   if dz>0:dz=.022*(sin(t)**.55)
+   else:dz*=1+.12*s*cos(t)
+   xx=xc+dx;zz=eyez+dz;yy=-.183+abs(xx)*.12
+   pts.append((xx,yy,zz))
+  o=mesh('Sunglasses • '+('left' if s>0 else 'right')+' smoky lens',[(xc,-.184,eyez)]+pts,[[0,i+1,(i+1)%64+1] for i in range(64)],lens)
+  solid(o,.0015);curve('Sunglasses • aviator rim',pts,.0013,metal,main,True)
+  curve('Sunglasses • temple '+str(s),[(s*.076,-.174,eyez+.012),(s*.091,-.108,eyez+.012),(s*.092,-.038,eyez+.01),(s*.09,.006,eyez-.012)],.0018,metal,main)
+  uvball('Sunglasses • nose pad',(s*.012,-.169,eyez-.005),(.004,.004,.006),black)
+ curve('Sunglasses • curved bridge',[(-.012,-.182,eyez+.011),(0,-.186,eyez+.017),(.012,-.182,eyez+.011)],.0013,metal,main)
+ curve('Sunglasses • upper bridge',[(-.026,-.177,eyez+.027),(0,-.182,eyez+.029),(.026,-.177,eyez+.027)],.0011,metal,main)
+ # Eyeballs behind sunglasses, lips retain the anatomical shape.
+ eyewhite=mat('Eyes • warm ivory',(.66,.65,.60),.3)
+ for s in [-1,1]:uvball('Body • eye '+str(s),(s*.034,-.132,1.640),(.013,.013,.012),eyewhite)
+ # Continuous skin color attribute keeps lips and short beard softly blended.
+ colors=body.data.color_attributes.new(name='Skin tones',type='FLOAT_COLOR',domain='POINT')
+ for vtx in body.data.vertices:
+  x,y,z=vtx.co;col=Vector(CFG['skin_color'])
+  if y<-.08 and 1.51<z<1.62:
+   top=1.563+.47*abs(x)
+   bm=max(0,min(1,(top-z)/.006))
+   bm*=max(0,min(1,(z-1.522)/.018))
+   if ((x/.034)**2+((z-1.571)/.009)**2)<1:bm=0
+   moust=exp(-((z-1.584)/.0035)**2)*max(0,1-(abs(x)/.039)**4)
+   amount=min(.70,max(bm*.65,moust*.85)) if CFG['beard'] else 0
+   col=col.lerp(Vector(CFG['hair_color']),amount)
+   lm=exp(-((z-1.572)/.0036)**2)*max(0,1-(abs(x)/.028)**4)
+   col=col.lerp(Vector((CFG['skin_color'][0]*.86,CFG['skin_color'][1]*.61,CFG['skin_color'][2]*.63)),lm*.8)
+  colors.data[vtx.index].color=(*col,1)
+ nt=skin.node_tree;vc=nt.nodes.new('ShaderNodeVertexColor');vc.layer_name='Skin tones';nt.links.new(vc.outputs['Color'],nt.nodes.get('Principled BSDF').inputs['Base Color'])
+ # Scalp shell and combed strands sample actual skull shape.
+ center=Vector((0,-.029,1.669))
+ def hairpoint(a,t,extra=0):
+  direction=Vector((sin(t)*cos(a),sin(t)*sin(a),cos(t)))
+  # Cast from outside toward the head, avoiding internal mouth surfaces.
+  hit=bodybvh.ray_cast(center+direction*.3,-direction,.4)
+  p=hit[0] if hit[0] else center+Vector((direction.x*.077,direction.y*.09,direction.z*.084))
+  lift=.003+.014*max(0,cos(t))
+  lift+=.022*exp(-((a-4.1)/1.1)**2)*max(0,cos(t))*sin(t)
+  return p+direction*(lift+extra)
+ def max_t(a):
+  # Front hairline high, short sides, longer nape.
+  frontness=max(0,-sin(a));backness=max(0,sin(a))
+  return 1.95-.55*frontness+.18*backness+.025*sin(a*9)
+ hv=[];hf=[];NA=100;NT=20
+ for j in range(NT+1):
+  for i in range(NA):
+   a=2*pi*i/NA;t=.015+(max_t(a)-.015)*j/NT;hv.append(hairpoint(a,t))
+ for j in range(NT):
+  for i in range(NA):hf.append((j*NA+i,j*NA+(i+1)%NA,(j+1)*NA+(i+1)%NA,(j+1)*NA+i))
+ cap=mesh('Hair • sculpted swept scalp',hv,hf,hairmat,haircoll);sub(cap,1);solid(cap,.002)
+ # Hair fibers combined into three objects for editability and efficient export.
+ def multi_strands(n,paths,r,ma,c=haircoll):
+  cu=bpy.data.curves.new(n,'CURVE');cu.dimensions='3D';cu.resolution_u=1;cu.bevel_depth=r;cu.bevel_resolution=1
+  for points in paths:
+   sp=cu.splines.new('POLY');sp.points.add(len(points)-1)
+   for k,(p,co) in enumerate(zip(sp.points,points)):p.co=(*co,1);p.radius=max(.08,sin(pi*(k+.5)/len(points))**.4)
+  o=bpy.data.objects.new(n,cu);c.objects.link(o);o.data.materials.append(ma);return o
+ paths=[];lightpaths=[]
+ for i in range(5400):
+  a=random.random()*2*pi;t=random.uniform(.12,max_t(a));pts=[]
+  length=random.uniform(.23,.65);sweep=.43 if sin(a)<0 else .18
+  for k in range(9):
+   u=k/8;aa=a+sweep*u;tt=max(.035,t-length*u)
+   pts.append(hairpoint(aa,tt,.001+sin(pi*u)*.004))
+  (lightpaths if i%9==0 else paths).append(pts)
+ multi_strands('Hair • combed dark fibers',paths,.00028,hairmat)
+ multi_strands('Hair • sunlit brown fibers',lightpaths,.00024,hairlight)
+ tufts=[]
+ for i in range(120):
+  a=random.uniform(3.2,5.7);t=random.uniform(.35,1.3);pts=[]
+  for k in range(12):
+   u=k/11;pts.append(hairpoint(a+.55*u,max(.03,t-.52*u),.002+sin(pi*u)*random.uniform(.004,.012)))
+  tufts.append(pts)
+ multi_strands('Hair • loose swept wisps',tufts,.00032,hairmat)
+ # Short facial hair, each strand follows the existing face surface.
+ bpaths=[]
+ for i in range(11000 if CFG['beard'] else 0):
+  x=random.uniform(-.088,.088);z=random.uniform(1.522,1.622)
+  cheektop=1.563+.47*abs(x)
+  moustache=(abs(x)<.035 and 1.579<z<1.59 and z<1.59-.10*abs(x))
+  beard=(z<cheektop and not (((x/.032)**2+((z-1.571)/.008)**2)<1))
+  if not (moustache or beard):continue
+  hit=bodybvh.ray_cast(Vector((x,-1,z)),Vector((0,1,0)))
+  if hit[0] is None or hit[0].y>-.062:continue
+  p=hit[0]+hit[1]*.00025;normal=hit[1]
+  end=p+normal*random.uniform(.0005,.0014)+Vector((random.uniform(-.0004,.0004),0,-.00065))
+  bpaths.append([p,end])
+ multi_strands('Beard • trimmed moustache and stubble',bpaths,.00012,beardmat)
+ # Watch on the subject's left wrist (viewer right).
+ wrist=Vector(posed['wrist.L']['head']);elbow=Vector(posed['lowerarm01.L']['head']);axis=(elbow-wrist).normalized();watchcenter=wrist+axis*.022
+ u=Vector((0,-1,0));u=(u-axis*u.dot(axis)).normalized();vv=axis.cross(u).normalized()
+ pts=[watchcenter+u*(.036*cos(2*pi*i/64))+vv*(.028*sin(2*pi*i/64)) for i in range(64)]
+ # Flat band ring, built with its own quad mesh.
+ vs=[];fs=[]
+ for k in [-1,1]:
+  for p in pts:vs.append(p+axis*k*.011)
+ for i in range(64):fs.append((i,(i+1)%64,(i+1)%64+64,i+64))
+ strap=mesh('Watch • black resin strap',vs,fs,black);solid(strap,.0025);sub(strap,1)
+ casecenter=watchcenter+u*.038
+ case=cube('Watch • rectangular digital case',casecenter,(.036,.012,.044),black,.004)
+ # Local X along wrist width, local Y inward, local Z up the forearm.
+ rot=Matrix((vv,u,axis)).transposed().to_4x4();case.rotation_euler=rot.to_euler()
+ display=mat('Watch • dark LCD glass',(.065,.085,.083),.23,.2)
+ face=cube('Watch • LCD inset',casecenter+u*.008,(.027,.002,.026),display,.002);face.rotation_euler=case.rotation_euler
+ # Inferred simple period canvas sneakers.
+ for s in [-1,1]:
+  x=s*.176
+  vs=[];fs=[];N=64
+  rings=[(.018,1),(.045,1),(.065,.99),(.094,.92),(.116,.69),(.119,.38)]
+  for z,shrink in rings:
+   for i in range(N):
+    a=2*pi*i/N;xx=.079*math.copysign(abs(cos(a))**.65,cos(a))*shrink;yy=.149*math.copysign(abs(sin(a))**.6,sin(a))*shrink
+    zz=z-(.025*max(0,-sin(a)) if z>.065 else 0)
+    vs.append((x+xx,-.076+yy,zz))
+  for j in range(len(rings)-1):
+   for i in range(N):fs.append((j*N+i,j*N+(i+1)%N,(j+1)*N+(i+1)%N,(j+1)*N+i))
+  fs.append(tuple(range((len(rings)-1)*N,len(rings)*N)))
+  shoe=mesh('Sneakers • canvas upper '+str(s),vs,fs,shoemat);sub(shoe,1)
+  sole=cube('Sneakers • rubber sole '+str(s),(x,-.076,.026),(.164,.308,.039),solemat,.012)
+  for k in range(5):
+   z=.12-.004*k;y=-.037-.016*k
+   curve('Sneakers • lace '+str(s)+' '+str(k),[(x-.023,y,z),(x,y-.004,z+.002),(x+.023,y,z)],.0013,solemat)
+ # Remove isolated unused mesh vertices left by garment trimming.
+ for o in [shirt,jeans]:
+  bm=bmesh.new();bm.from_mesh(o.data);unused=[v for v in bm.verts if not v.link_faces]
+  if unused:bmesh.ops.delete(bm,geom=unused,context='VERTS')
+  bm.to_mesh(o.data);bm.free()
+ # Model root and metadata.
+ root=bpy.data.objects.new('Storybook • CHARACTER ROOT',None);main.objects.link(root);root.empty_display_type='PLAIN_AXES';root.empty_display_size=.12
+ for c in [main,details,haircoll]:
+  for o in list(c.objects):
+   if o!=root:o.parent=root
+ root['Reference']=str(IMAGE.name);root['Method']='Photo palette plus adjustable anatomical template; approximate likeness, fixed standing pose.'
+ root['Units']='Meters. Stylized head and adult body proportions.'
+ root['Editing']='Static posed quad body; clothes, hair, sunglasses and watch remain separate. Not an animation-ready character.'
+ ref=bpy.data.images.load(str(IMAGE));ref.name='REFERENCE • input photograph';ref.pack();ref.use_fake_user=True
+ # Neutral photographic studio.
+ floor=mat('Studio • warm graphite',(.078,.086,.092),.85)
+ cube('Studio ground',(0,0,-.012),(200,200,.02),floor,0,stage)
+ world=bpy.data.worlds.new('Studio soft environment');bpy.context.scene.world=world;world.use_nodes=True;world.node_tree.nodes['Background'].inputs[0].default_value=(.25,.29,.34,1);world.node_tree.nodes['Background'].inputs[1].default_value=.4
+ def light(n,loc,power,size,color):
+  d=bpy.data.lights.new(n,'AREA');o=bpy.data.objects.new(n,d);stage.objects.link(o);o.location=loc;d.energy=power;d.shape='DISK';d.size=size;d.color=color;o.rotation_euler=(Vector((0,0,1.05))-o.location).to_track_quat('-Z','Y').to_euler()
+ light('Key • large softbox',(-3,-4,5),450,3.2,(1,.85,.73));light('Fill • cool sky',(3,-2,3),230,2.7,(.71,.84,1));light('Rim • warm autumn',(1.3,2.5,3.7),500,2.2,(1,.74,.48))
+ def camera(n,loc,target,ortho):
+  d=bpy.data.cameras.new(n);o=bpy.data.objects.new(n,d);stage.objects.link(o);o.location=loc;o.rotation_euler=(Vector(target)-o.location).to_track_quat('-Z','Y').to_euler();d.type='ORTHO';d.ortho_scale=ortho;d.lens=65;return o
+ cam=camera('Camera • full figure',(2.3,-7.5,2.6),(0,-.015,.94),2.04)
+ frontcam=camera('Camera • front reference',(0,-7,1.3),(0,-.02,.99),2.02)
+ portraitcam=camera('Camera • portrait',(0,-7,1.74),(0,-.045,1.40),.84)
+ sc=bpy.context.scene;sc.camera=cam;sc.render.engine='CYCLES';sc.cycles.samples=32;sc.cycles.use_denoising=True;sc.render.resolution_x=1000;sc.render.resolution_y=1200;sc.render.resolution_percentage=100
+ sc.view_settings.view_transform='AgX';sc.render.image_settings.file_format='PNG';sc.unit_settings.system='METRIC'
+ # Correct hidden hands against both trouser surfaces.
+ handgroups={g.index for g in body.vertex_groups if g.name.startswith(('wrist','finger','metacarpal'))}
+ for p in body.data.vertices:
+  w=min(1,sum(g.weight for g in p.groups if g.group in handgroups))
+  if w<.1 or p.co.z>.95:continue
+  p.co.y-=.095*min(1,max(0,(.95-p.co.z)/.035))*w
+  if p.co.z<.935:
+   for k in range(15):
+    x=p.co.x*(1-.015*k);z=p.co.z
+    a=jeansbvh.ray_cast(Vector((x,-1,z)),Vector((0,1,0)))[0];b=jeansbvh.ray_cast(Vector((x,1,z)),Vector((0,-1,0)))[0]
+    if a is not None and b is not None and b.y-a.y>.025:
+     p.co.x=x;p.co.y=max(a.y+.01,min(b.y-.01,p.co.y));break
+ body.data.update()
+ # Use real photo colors with a restrained hand-painted material variation.
+ def set_color(material,color,paint=False):
+  material.diffuse_color=(*color,1);nt=material.node_tree;ps=nt.nodes.get('Principled BSDF')
+  ps.inputs['Base Color'].default_value=(*color,1);ps.inputs['Roughness'].default_value=.82
+  for node in nt.nodes:
+   if node.type=='VALTORGB':
+    node.color_ramp.elements[0].color=(*[v*.80 for v in color],1)
+    node.color_ramp.elements[1].color=(*[min(1,v*1.12+.003) for v in color],1)
+  if not paint:
+   for link in list(ps.inputs['Base Color'].links):nt.links.remove(link)
+ set_color(cloth,CFG['shirt_color'],True);set_color(denim,CFG['pants_color'],True)
+ set_color(hairmat,CFG['hair_color']);set_color(hairlight,[min(.65,c*1.6+.004) for c in CFG['hair_color']]);set_color(beardmat,[c*.85 for c in CFG['hair_color']])
+ # Omit optional accessories rather than assuming every person wears them.
+ for o in list(bpy.data.objects):
+  if (o.name.startswith('Sunglasses') and not CFG['sunglasses']) or (o.name.startswith('Watch') and not CFG['watch']):bpy.data.objects.remove(o,do_unlink=True)
+ # Eye whites, irises, expressive brows and a small smile.
+ for o in list(bpy.data.objects):
+  if o.name.startswith('Body • eye'):bpy.data.objects.remove(o,do_unlink=True)
+ ink=mat('Drawing • warm charcoal',(.019,.012,.011),.9)
+ iris=mat('Eyes • chestnut iris',(.072,.045,.021),.6)
+ glint=mat('Eyes • catchlight',(.95,.96,.88),.4)
+ lipline=mat('Drawing • lip contour',[c*.40 for c in CFG['skin_color']],.9)
+ for sign in [-1,1]:
+  x=sign*.035;z=1.640;eye_y=min(front(bodybvh,x,z).y-.001,-.167)
+  width=.017*CFG['eye_scale'];height=.009*CFG['eye_scale']
+  # A shallow almond-shaped eye, rather than a protruding eyeball.
+  eye_y=-.166
+  contour=[]
+  for k in range(48):
+   t=2*pi*k/48;dx=width*cos(t);dz=height*math.copysign(abs(sin(t))**1.4,sin(t))
+   contour.append((x+dx,eye_y+.0015*abs(cos(t)),z+dz))
+  eye=mesh('Face • eye white '+str(sign),[(x,eye_y-.0004,z)]+contour,[(0,k+1,(k+1)%48+1) for k in range(48)],eyewhite)
+  uvball('Face • iris '+str(sign),(x+.001,eye_y-.0009,z),(.0069,.00055,.0084),iris)
+  uvball('Face • pupil '+str(sign),(x+.001,eye_y-.0015,z),(.0034,.00035,.0062),ink)
+  uvball('Face • catchlight '+str(sign),(x-.0015,eye_y-.002,z+.0034),(.0015,.00025,.0016),glint)
+  pts=[(x+width*cos(t),eye_y-.0008,z+height*(sin(t)**1.4)) for t in [i*pi/24 for i in range(25)]]
+  curve('Face • upper eyelid '+str(sign),pts,.00075,ink,main)
+  pts=[(x+width*cos(t),eye_y-.0006,z-height*(sin(t)**1.4)) for t in [i*pi/24 for i in range(25)]]
+  curve('Face • lower eyelid '+str(sign),pts,.00035,lipline,main)
+  pts=[front(bodybvh,x+v,z+.026+.004*(1-abs(v)/.020),.002) for v in [-.020,-.01,0,.01,.020]]
+  curve('Face • eyebrow '+str(sign),pts,.0016,hairmat,main)
+ smile=[front(bodybvh,x,1.571+.005*(abs(x)/.025)**1.7,.0008) for x in [-.025,-.018,-.009,0,.009,.018,.025]]
+ curve('Face • smile contour',smile,.00045,lipline,main)
+ # Gentle cheek blush and a softened nose.
+ colors=body.data.color_attributes.get('Skin tones')
+ for p in body.data.vertices:
+  x,y,z=p.co
+  if y<-.10 and 1.57<z<1.64:
+   strength=.22*exp(-((abs(x)-.048)/.018)**2-((z-1.608)/.013)**2)
+   original=Vector(colors.data[p.index].color[:3]);blush=Vector((CFG['skin_color'][0]*1.12,CFG['skin_color'][1]*.69,CFG['skin_color'][2]*.70))
+   colors.data[p.index].color=(*original.lerp(blush,strength),1)
+  if abs(x)<.024 and 1.592<z<1.632 and y<-.15:
+   influence=exp(-(x/.016)**2-((z-1.610)/.022)**2);p.co.y+=.009*influence
+ # Longer hair is a separate editable curtain of quads and drawn strands.
+ if CFG['hair'] in ['bob','long']:
+  end=1.52 if CFG['hair']=='bob' else 1.30
+  vs=[];fs=[];NU=56;NV=18
+  def curtain(u,t):
+   a=-.13+(pi+.26)*u
+   top=hairpoint(a,1.32,.001)
+   z=top.z*(1-t)+end*t+.005*sin(u*25)*t
+   radius=.091+(.015 if CFG['hair']=='bob' else .042)*t
+   return Vector((cos(a)*radius, -.023+sin(a)*(.088+.019*t),z))
+  for j in range(NV+1):
+   for i in range(NU+1):vs.append(curtain(i/NU,j/NV))
+  for j in range(NV):
+   for i in range(NU):
+    a=j*(NU+1)+i;fs.append((a,a+NU+1,a+NU+2,a+1))
+  o=mesh('Hair • '+CFG['hair']+' curtain',vs,fs,hairmat,haircoll);sub(o,1);solid(o,.003)
+  paths=[]
+  for i in range(230):
+   u=random.random();paths.append([curtain(min(1,max(0,u+.009*sin(j/2))),j/15)+Vector((0,.001,0)) for j in range(16)])
+  multi_strands('Hair • long painted strands',paths,.00032,hairlight)
+ if CFG['hair']=='bald':
+  for o in list(haircoll.objects):
+   if o.name.startswith('Hair •'):bpy.data.objects.remove(o,do_unlink=True)
+ # Optional user-entered chest lettering, projected onto the actual shirt.
+ if CFG['shirt_text']:
+  cu=bpy.data.curves.new('Editable shirt text','FONT');cu.body=CFG['shirt_text'][:32];cu.size=.065;cu.align_x='CENTER';cu.extrude=0
+  o=bpy.data.objects.new('Shirt • lettering',cu);details.objects.link(o);cu.materials.append(solemat);o.location=(0,-.22,1.23);o.rotation_euler=(pi/2,0,0);bpy.context.view_layer.update()
+  if o.dimensions.x>.25:o.scale*=.25/o.dimensions.x
+  bpy.ops.object.select_all(action='DESELECT');o.select_set(True);bpy.context.view_layer.objects.active=o;bpy.ops.object.convert(target='MESH')
+  bm=bmesh.new();bm.from_mesh(o.data);bmesh.ops.triangulate(bm,faces=list(bm.faces));bmesh.ops.subdivide_edges(bm,edges=list(bm.edges),cuts=3,use_grid_fill=True);bm.to_mesh(o.data);bm.free()
+  for p in o.data.vertices:
+   worldv=o.matrix_world@p.co;p.co=o.matrix_world.inverted()@front(shirtbvh,worldv.x,worldv.z,.003)
+ # Apply a common stylization transform to the head and all its accessories.
+ pivot=Vector((0,-.02,1.505));head_scale=CFG['head_scale'];width_factor=float(np.clip(CFG['face_width']/1.0,.92,1.08))
+ scalevec=Vector((head_scale*width_factor,head_scale*.96,head_scale*.95))
+ for p in body.data.vertices:
+  if p.co.z>1.505:
+   f=min(1,(p.co.z-1.505)/.035);relative=p.co-pivot
+   p.co=pivot+Vector(tuple(relative[i]*(1+(scalevec[i]-1)*f) for i in range(3)))
+ transform=Matrix.Translation(pivot)@Matrix.Diagonal((*scalevec,1))@Matrix.Translation(-pivot)
+ for o in list(main.objects)+list(haircoll.objects):
+  if o==body:continue
+  if o.name.startswith(('Hair •','Beard •','Sunglasses •','Face •')):o.matrix_world=transform@o.matrix_world
+ # Soft daylight and a muted cel-animation palette.
+ set_color(floor,(.28,.36,.32));world.node_tree.nodes['Background'].inputs[0].default_value=(.59,.71,.74,1);world.node_tree.nodes['Background'].inputs[1].default_value=.65
+ for o in stage.objects:
+  if o.type=='LIGHT':o.data.energy*=.85
+ cam.data.ortho_scale=2.15;cam.location=(2,-7.5,2.25);cam.rotation_euler=(Vector((0,-.02,.98))-cam.location).to_track_quat('-Z','Y').to_euler();sc.camera=cam
+ portraitcam.data.ortho_scale=.96;portraitcam.location=(.15,-7,1.85);portraitcam.rotation_euler=(Vector((0,-.06,1.47))-portraitcam.location).to_track_quat('-Z','Y').to_euler()
+ sc.view_settings.view_transform='AgX';sc.cycles.samples=32;sc.render.resolution_x=CFG['resolution'];sc.render.resolution_y=int(CFG['resolution']*1.2)
+ # Cel shading for the native Blender scene; GLB uses the underlying PBR shader.
+ try:sc.render.engine='BLENDER_EEVEE_NEXT'
+ except TypeError:sc.render.engine='BLENDER_EEVEE'
+ toon_mats=[skin,cloth,denim,hairmat,hairlight,beardmat,shoemat,solemat,eyewhite,iris]
+ for material in toon_mats:
+  nt=material.node_tree;ps=nt.nodes.get('Principled BSDF');output=nt.nodes.get('Material Output')
+  diffuse=nt.nodes.new('ShaderNodeBsdfDiffuse');diffuse.inputs['Color'].default_value=(1,1,1,1)
+  rgb=nt.nodes.new('ShaderNodeShaderToRGB');nt.links.new(diffuse.outputs[0],rgb.inputs[0])
+  ramp=nt.nodes.new('ShaderNodeValToRGB');ramp.label='Cel light bands';ramp.color_ramp.interpolation='CONSTANT'
+  ramp.color_ramp.elements[0].position=.14;ramp.color_ramp.elements[0].color=(.47,.53,.60,1)
+  ramp.color_ramp.elements[1].position=.60;ramp.color_ramp.elements[1].color=(1.12,1.08,1.0,1)
+  middle=ramp.color_ramp.elements.new(.33);middle.color=(.83,.85,.86,1);nt.links.new(rgb.outputs[0],ramp.inputs[0])
+  mix=nt.nodes.new('ShaderNodeMixRGB');mix.blend_type='MULTIPLY';mix.inputs[0].default_value=1;nt.links.new(ramp.outputs[0],mix.inputs[1])
+  if ps.inputs['Base Color'].links:nt.links.new(ps.inputs['Base Color'].links[0].from_socket,mix.inputs[2])
+  else:mix.inputs[2].default_value=ps.inputs['Base Color'].default_value
+  emission=nt.nodes.new('ShaderNodeEmission');nt.links.new(mix.outputs[0],emission.inputs['Color']);nt.links.new(emission.outputs[0],output.inputs['Surface'])
+ # Inverted hulls provide a thin drawn contour in the Blender presentation.
+ outlines=coll('OUTLINES • generated toon contours');outline_mat=mat('Outline • warm ink',(.009,.007,.011),1);outline_mat.use_backface_culling=True
+ bpy.context.view_layer.update()
+ for original in [body,shirt,jeans]+[o for o in haircoll.objects if 'sculpted swept scalp' in o.name or 'curtain' in o.name]:
+  thickness=[m for m in original.modifiers if m.type=='SOLIDIFY']
+  for m in thickness:m.show_viewport=False
+  bpy.context.view_layer.update()
+  ev=original.evaluated_get(bpy.context.evaluated_depsgraph_get());me=ev.to_mesh();verts=[v.co+v.normal*.00135 for v in me.vertices]
+  faces_out=[tuple(reversed(p.vertices)) for p in me.polygons if original!=body or p.center.z>1.505 or (abs(p.center.x)>.19 and 1.0<p.center.z<1.24)]
+  hull=mesh('Contour • '+original.name,verts,faces_out,outline_mat,outlines);hull.matrix_world=original.matrix_world.copy();hull.parent=root;ev.to_mesh_clear()
+  for m in thickness:m.show_viewport=True
+ # Construction rig was used only to establish the static pose.
+ for o in list(bpy.data.objects):
+  if o.type=='ARMATURE':bpy.data.objects.remove(o,do_unlink=True)
+ # Parent any late-created features to the single character root.
+ for c in [main,details,haircoll]:
+  for o in c.objects:
+   if o!=root and not o.parent:o.parent=root
+ name=CFG['name'] or (IMAGE.stem+'_storybook')
+ native=OUT/(name+'.blend');exchange=OUT/(name+'.glb')
+ packed=bpy.data.objects.new('Reference • input image (hidden)',None);source.objects.link(packed);packed.empty_display_type='IMAGE';packed.data=ref;packed.location=(-1.2,.4,1);packed.rotation_euler=(pi/2,0,0);packed.hide_render=True;packed.hide_set(True)
+ notes={'generator':'Photo to Storybook 3D 1.0','input':IMAGE.name,'config':CFG,'analysis':ANALYSIS,
+ 'limitations':['Approximate parametric character, not photogrammetry.','Fixed adult standing pose; proportions, clothing and hidden surfaces are inferred.','No animation rig; single photo cannot recover unseen geometry.','Hair, beard and accessories are presets, not automatic semantic reconstruction.']}
+ (OUT/(name+'_settings.json')).write_text(json.dumps(notes,indent=2))
+ txt=bpy.data.texts.new('READ ME • generation notes');txt.write(json.dumps(notes,indent=2))
+ bpy.ops.file.pack_all();bpy.ops.object.select_all(action='DESELECT');shirt.select_set(True);bpy.context.view_layer.objects.active=shirt
+ for screen in bpy.data.screens:
+  for area in screen.areas:
+   if area.type=='VIEW_3D':
+    area.spaces.active.region_3d.view_distance=3.;area.spaces.active.region_3d.view_location=(0,0,.98);area.spaces.active.region_3d.view_rotation=cam.rotation_euler.to_quaternion();area.spaces.active.shading.type='MATERIAL'
+ sc.render.filepath=str(OUT/(name+'_preview.png'));bpy.ops.wm.save_as_mainfile(filepath=str(native))
+ if CFG['render']:bpy.ops.render.render(write_still=True)
+ if CFG['glb']:
+  # Shader-to-RGB and contour hulls are Blender-specific; restore portable PBR.
+  for material in toon_mats:
+   nt=material.node_tree;nt.links.new(nt.nodes.get('Principled BSDF').outputs[0],nt.nodes.get('Material Output').inputs['Surface'])
+  bpy.ops.object.select_all(action='DESELECT');export_objects=[]
+  for c in [main,details,haircoll]:export_objects+=list(c.objects)
+  for o in export_objects:
+   o.hide_set(False);o.select_set(True)
+   if o.type=='CURVE' and o.name.startswith(('Hair •','Beard •')):
+    o.data.bevel_resolution=0
+    if 'combed dark' in o.name:
+     for spline in list(o.data.splines)[1::2]:o.data.splines.remove(spline)
+   if o.type in ['MESH','CURVE']:
+    for material in o.data.materials:
+     if not material or material==skin:continue
+     ps=material.node_tree.nodes.get('Principled BSDF')
+     if ps:
+      for link in list(ps.inputs['Base Color'].links):material.node_tree.links.remove(link)
+      ps.inputs['Base Color'].default_value=material.diffuse_color
+  bpy.context.view_layer.objects.active=body;bpy.ops.object.convert(target='MESH')
+  bpy.ops.export_scene.gltf(filepath=str(exchange),export_format='GLB',use_selection=True,export_animations=False,export_cameras=False,export_lights=False,export_extras=True)
+ return {'blend':str(native),'glb':str(exchange) if CFG['glb'] else None,'preview':str(OUT/(name+'_preview.png')) if CFG['render'] else None,'notes':ANALYSIS['notes']}
+
+def run_cli(argv):
+ p=argparse.ArgumentParser(description='Generate a photo-guided storybook/anime character in Blender.')
+ p.add_argument('--image',required=True);p.add_argument('--output',required=True);p.add_argument('--config');p.add_argument('--name')
+ p.add_argument('--body',choices=['neutral','masculine','feminine']);p.add_argument('--hair',choices=['swept','bob','long','bald'])
+ p.add_argument('--sunglasses',choices=['auto','on','off']);p.add_argument('--beard',action='store_true',default=None);p.add_argument('--watch',action='store_true',default=None)
+ p.add_argument('--frame',choices=['portrait','full-body']);p.add_argument('--face-box',type=float,nargs=4)
+ p.add_argument('--head-scale',type=float);p.add_argument('--eye-scale',type=float);p.add_argument('--shirt-text');p.add_argument('--seed',type=int);p.add_argument('--resolution',type=int)
+ p.add_argument('--no-render',action='store_true');p.add_argument('--no-glb',action='store_true');p.add_argument('--overwrite',action='store_true')
+ args=p.parse_args(argv);cfg=dict(DEFAULTS)
+ if args.config:
+  data=json.loads(pathlib.Path(args.config).expanduser().read_text())
+  unknown=set(data)-set(DEFAULTS)
+  if unknown:raise ValueError('Unknown config keys: '+', '.join(sorted(unknown)))
+  cfg.update(data)
+ for key in DEFAULTS:
+  value=getattr(args,key,None)
+  if value is not None and key not in ['overwrite']:cfg[key]=value
+ cfg['render']=not args.no_render and cfg['render'];cfg['glb']=not args.no_glb and cfg['glb'];cfg['overwrite']=args.overwrite or cfg['overwrite']
+ validate_config(cfg)
+ image=pathlib.Path(args.image).expanduser().resolve()
+ if not image.is_file():raise FileNotFoundError('Photo not found: '+str(image))
+ out=pathlib.Path(args.output).expanduser().resolve();stem=cfg['name'] or (image.stem+'_storybook')
+ if not cfg['overwrite']:
+  base=stem;i=2
+  while any((out/(stem+s)).exists() for s in ['.blend','.glb','_preview.png','_settings.json']):stem=base+f'_{i:03d}';i+=1
+ cfg['name']=stem
+ original_cfg=dict(cfg)
+ cache=cache_assets();analysis=analyze_photo(image,cfg,cache)
+ recipe=dict(original_cfg);recipe['overwrite']=False;recipe['face_box']=analysis['face_box'];recipe['sunglasses']='on' if cfg['sunglasses'] else 'off'
+ for key,short in [('skin_color','skin'),('hair_color','hair'),('shirt_color','shirt'),('pants_color','pants')]:
+  if recipe[key] is None:recipe[key]=analysis['sampled_srgb'][short]
+ out.mkdir(parents=True,exist_ok=True)
+ result=build_character(cfg,analysis,image,out,cache)
+ (out/(stem+'_recipe.json')).write_text(json.dumps(recipe,indent=2))
+ print('STORYBOOK_RESULT='+json.dumps(result),flush=True)
+
+JOBS={}
+SCRIPT_PATH=pathlib.Path(globals().get('__file__','')).resolve()
+class STORYBOOK_Settings(bpy.types.PropertyGroup):
+ image: StringProperty(name='Person photo',subtype='FILE_PATH')
+ output: StringProperty(name='Save folder',subtype='DIR_PATH',default='//storybook_output/')
+ body: EnumProperty(name='Body preset',items=[(x,x.title(),'Template preference, not inferred from the photo') for x in ['neutral','masculine','feminine']],default='neutral')
+ hair: EnumProperty(name='Hair',items=[(x,x.title(),'') for x in ['swept','bob','long','bald']],default='swept')
+ sunglasses: EnumProperty(name='Sunglasses',items=[('auto','Estimate from photo','Heuristic; override if incorrect'),('on','On',''),('off','Off','')],default='auto')
+ beard: BoolProperty(name='Short beard',default=False)
+ watch: BoolProperty(name='Wristwatch',default=False)
+ head_scale: FloatProperty(name='Head stylization',min=1,max=1.5,default=1.2)
+ eye_scale: FloatProperty(name='Eye size',min=.8,max=1.7,default=1.15)
+ frame: EnumProperty(name='Fallback framing',items=[('portrait','Portrait',''),('full-body','Full body','')],default='portrait')
+ manual_face: BoolProperty(name='Use manual face box',default=False)
+ face_box: FloatVectorProperty(name='Left / Top / Width / Height',size=4,min=0,max=1,default=(.32,.12,.36,.40))
+ custom_colors: BoolProperty(name='Override sampled colors',default=False)
+ skin_color: FloatVectorProperty(name='Skin',subtype='COLOR_GAMMA',size=3,min=0,max=1,default=(.68,.45,.32))
+ hair_color: FloatVectorProperty(name='Hair',subtype='COLOR_GAMMA',size=3,min=0,max=1,default=(.16,.095,.055))
+ shirt_color: FloatVectorProperty(name='Shirt',subtype='COLOR_GAMMA',size=3,min=0,max=1,default=(.30,.47,.40))
+ pants_color: FloatVectorProperty(name='Trousers',subtype='COLOR_GAMMA',size=3,min=0,max=1,default=(.38,.52,.64))
+ shirt_text: StringProperty(name='Shirt lettering',default='',maxlen=32)
+ render: BoolProperty(name='Render a preview',default=True)
+ glb: BoolProperty(name='Also export GLB',default=True)
+ status: StringProperty(default='Choose a photo to begin.')
+ last_blend: StringProperty(default='',subtype='FILE_PATH')
+
+class STORYBOOK_OT_generate(bpy.types.Operator):
+ bl_idname='storybook.generate';bl_label='Create Storybook Character';bl_description='Generate in a separate Blender process, preserving the currently open file'
+ def execute(self,context):
+  if JOBS:self.report({'WARNING'},'A character is already being generated.');return {'CANCELLED'}
+  st=context.scene.storybook_settings;photo=pathlib.Path(bpy.path.abspath(st.image)).expanduser();out=pathlib.Path(bpy.path.abspath(st.output)).expanduser()
+  if not photo.is_file():self.report({'ERROR'},'Choose an existing photograph.');return {'CANCELLED'}
+  if not SCRIPT_PATH.is_file():self.report({'ERROR'},'Save this script as a .py file, reopen it, then Run Script.');return {'CANCELLED'}
+  out.mkdir(parents=True,exist_ok=True)
+  cfg={k:getattr(st,k) for k in ['body','hair','sunglasses','beard','watch','head_scale','eye_scale','frame','shirt_text','render','glb']}
+  if st.manual_face:cfg['face_box']=list(st.face_box)
+  if st.custom_colors:
+   for k in ['skin_color','hair_color','shirt_color','pants_color']:cfg[k]=list(getattr(st,k))
+  cache=cache_assets();stamp=str(time.time_ns());cf=cache/('job_'+stamp+'.json');cf.write_text(json.dumps(cfg));log=out/('storybook_job_'+stamp+'.log');handle=log.open('w')
+  cmd=[bpy.app.binary_path,'--background','--factory-startup','--python-exit-code','1','--python',str(SCRIPT_PATH),'--','--image',str(photo),'--output',str(out),'--config',str(cf)]
+  try:process=subprocess.Popen(cmd,stdout=handle,stderr=subprocess.STDOUT)
+  except OSError as exc:handle.close();self.report({'ERROR'},str(exc));return {'CANCELLED'}
+  st.status='Generating… Blender can stay open.';scene=context.scene
+  JOBS.update(process=process,handle=handle,log=log)
+  def tick():
+   if process.poll() is None:return 1.0
+   handle.close();content=log.read_text(errors='replace');JOBS.clear()
+   try:
+    results=[line.split('STORYBOOK_RESULT=',1)[1] for line in content.splitlines() if line.startswith('STORYBOOK_RESULT=')]
+    if process.returncode==0 and results:
+     result=json.loads(results[-1]);scene.storybook_settings.last_blend=result['blend'];scene.storybook_settings.status='Created: '+pathlib.Path(result['blend']).name
+    else:scene.storybook_settings.status='Could not finish. See '+log.name
+    for window in bpy.context.window_manager.windows:
+     for area in window.screen.areas:area.tag_redraw()
+   except ReferenceError:pass
+   return None
+  bpy.app.timers.register(tick,first_interval=1.)
+  return {'FINISHED'}
+
+class STORYBOOK_OT_open(bpy.types.Operator):
+ bl_idname='storybook.open_result';bl_label='Open Generated Blender File'
+ def invoke(self,context,event):return context.window_manager.invoke_confirm(self,event)
+ def execute(self,context):
+  path=context.scene.storybook_settings.last_blend
+  if not pathlib.Path(path).is_file():return {'CANCELLED'}
+  bpy.ops.wm.open_mainfile(filepath=path);return {'FINISHED'}
+
+class STORYBOOK_PT_panel(bpy.types.Panel):
+ bl_label='Photo to Storybook 3D';bl_idname='STORYBOOK_PT_panel';bl_space_type='VIEW_3D';bl_region_type='UI';bl_category='Storybook'
+ def draw(self,context):
+  l=self.layout;s=context.scene.storybook_settings
+  l.label(text='Photo-guided character, approximate likeness.')
+  l.prop(s,'image');l.prop(s,'output');l.prop(s,'body');l.prop(s,'hair');l.prop(s,'sunglasses')
+  row=l.row();row.prop(s,'beard');row.prop(s,'watch')
+  l.prop(s,'head_scale');l.prop(s,'eye_scale');l.prop(s,'shirt_text')
+  box=l.box();box.label(text='Photo sampling');box.prop(s,'frame');box.prop(s,'manual_face')
+  if s.manual_face:box.prop(s,'face_box')
+  box.prop(s,'custom_colors')
+  if s.custom_colors:
+   for k in ['skin_color','hair_color','shirt_color','pants_color']:box.prop(s,k)
+  row=l.row();row.prop(s,'render');row.prop(s,'glb')
+  row=l.row();row.enabled=not bool(JOBS);row.operator('storybook.generate',icon='OUTLINER_OB_ARMATURE')
+  l.label(text=s.status[:64])
+  if s.last_blend:l.operator('storybook.open_result',icon='FILE_BLEND')
+CLASSES=(STORYBOOK_Settings,STORYBOOK_OT_generate,STORYBOOK_OT_open,STORYBOOK_PT_panel)
+def register():
+ for cls in reversed(CLASSES):
+  old=getattr(bpy.types,cls.__name__,None)
+  if old:
+   try:bpy.utils.unregister_class(old)
+   except RuntimeError:pass
+ if hasattr(bpy.types.Scene,'storybook_settings'):del bpy.types.Scene.storybook_settings
+ for cls in CLASSES:bpy.utils.register_class(cls)
+ bpy.types.Scene.storybook_settings=bpy.props.PointerProperty(type=STORYBOOK_Settings)
+def unregister():
+ if hasattr(bpy.types.Scene,'storybook_settings'):del bpy.types.Scene.storybook_settings
+ for cls in reversed(CLASSES):
+  try:bpy.utils.unregister_class(cls)
+  except RuntimeError:pass
+if __name__=='__main__':
+ if bpy.app.background and '--' in sys.argv:run_cli(sys.argv[sys.argv.index('--')+1:])
+ else:register();print('Photo to Storybook: open 3D View > N sidebar > Storybook.')
