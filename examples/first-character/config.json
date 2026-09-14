@@ -1,0 +1,27 @@
+{
+  "body": "masculine",
+  "hair": "swept",
+  "sunglasses": "off",
+  "beard": false,
+  "watch": false,
+  "head_scale": 1.25,
+  "eye_scale": 1.1,
+  "shirt_text": "",
+  "frame": "full-body",
+  "face_box": [
+    0.438575,
+    0.066854,
+    0.113542,
+    0.085157
+  ],
+  "skin_color": null,
+  "hair_color": null,
+  "shirt_color": null,
+  "pants_color": null,
+  "seed": 87,
+  "render": true,
+  "glb": true,
+  "resolution": 960,
+  "overwrite": false,
+  "name": "first_character"
+}

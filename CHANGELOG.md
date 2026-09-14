@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- Added a reproducible worked example with a fictional input portrait, actual Blender render, settings, and downloadable models.
+
 ## 1.0.1
 
 - Public GitHub repository and release downloads.

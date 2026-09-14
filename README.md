@@ -4,6 +4,16 @@ Turn a person’s photo into an **editable storybook/anime-inspired 3D character
 
 This is an experimental **photo-guided template generator**. The photo guides colors and broad face proportions; hair, clothing, and the standing pose use adjustable presets. It does not reconstruct an exact likeness or arbitrary outfits. See [limitations](#limitations).
 
+## Worked example
+
+A fictional sample portrait, a runnable configuration, and a real render from the generated 3D model:
+
+| Input | Blender output |
+| --- | --- |
+| ![Fictional sample input](https://raw.githubusercontent.com/binaydhakal/photo-to-storybook/main/examples/first-character/input.png) | ![Generated storybook character](https://raw.githubusercontent.com/binaydhakal/photo-to-storybook/main/examples/first-character/preview.png) |
+
+[Follow the example](examples/first-character/README.md) · [Download the editable Blender/GLB example](https://github.com/binaydhakal/photo-to-storybook/releases/download/v1.0.1/first-character-example.zip)
+
 ## Get it
 
 Install the Python package from [PyPI](https://pypi.org/project/photo-to-storybook/), or download the Blender add-on and standalone script from [GitHub Releases](https://github.com/binaydhakal/photo-to-storybook/releases). The repository and release downloads are public.
@@ -115,4 +125,4 @@ See [contributing](CONTRIBUTING.md), [release instructions](docs/releasing.md), 
 
 Python/Swift application code: [MIT](LICENSE). Embedded MakeHuman base mesh, morph and rigging data: [CC0 1.0](ASSET_LICENSE.txt). The combined distribution declares `MIT AND CC0-1.0`.
 
-Asset source: [MakeHuman Community](https://github.com/makehumancommunity/makehuman). No affiliation with Studio Ghibli or Blender Foundation. No personal reference photographs or generated portraits are included in this source package.
+Asset source: [MakeHuman Community](https://github.com/makehumancommunity/makehuman). No affiliation with Studio Ghibli or Blender Foundation. The worked example uses a fictional AI-generated portrait, with its provenance documented in the example folder.

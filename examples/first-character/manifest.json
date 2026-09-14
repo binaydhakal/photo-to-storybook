@@ -1,0 +1,21 @@
+{
+  "package": "photo-to-storybook",
+  "version": "1.0.1",
+  "blender": "5.2.1",
+  "platform_tested": "macOS",
+  "input_type": "Fictional AI-generated portrait; no reference photograph",
+  "generation": "Published PyPI package, checked-in config, seed 87",
+  "sha256": {
+    "input.png": "29845bec4fe35cb10dc0903f0e95111c01cdac743a63b90332793a2f725a7538",
+    "preview.png": "1fba66e27acb446f3228c09e6fcee0d5df7e705d1b30e3f9500ec2953d673acb",
+    "config.json": "f8b756a03bf68fb090e67e99589f85eb1386a31d7873d12153ae4a946c41d7f9",
+    "README.md": "e8eabb3ab4e79e40e63210626d58ceb5ea1eea795b9b273948285e4c4511e529",
+    "generation-notes.md": "27ecb663b73f4d2044cd886ddd6bb84ea7879a9e843d117f786cce9d8454929d",
+    "LICENSE": "1b21f8d2e7e7741bc4499246760c9edf7cb9f1325cbf4a97e993fd92564a975d",
+    "ASSET_LICENSE.txt": "f6089cba01cb570a24712b41ab8a586ccd3cc5ef53dc266ca50b95c288956d2c",
+    "first_character.blend": "832d82d954f42c83c3643ebd86cd5378d455ea5f657f8b9470e6a12b783add8e",
+    "first_character.glb": "eae931e1196ef6ff0efd3e774c1ab2cceb801422119b7037bc95a67290b05bb5",
+    "first_character_recipe.json": "887ac4abfac7c155b84aa06ae64ddf4cd5d9a5f47139be97b31ceb9c17e39ec2",
+    "first_character_settings.json": "39d45839d0a999b8be91b391431ae830b4178648bfcad80ccc7bcbf967569771"
+  }
+}
