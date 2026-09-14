@@ -6,11 +6,11 @@ This is an experimental **photo-guided template generator**. The photo guides co
 
 ## Get it
 
-Download the installation files from [Releases](https://github.com/binaydhakal/photo-to-storybook/releases). This repository is private: only people with repository access can open these links. You can also give someone a downloaded wheel or add-on ZIP directly. The package has not been published on PyPI.
+Install the Python package from [PyPI](https://pypi.org/project/photo-to-storybook/), or download the Blender add-on and standalone script from [GitHub Releases](https://github.com/binaydhakal/photo-to-storybook/releases). The repository and release downloads are public.
 
 ### Blender users — no Python setup
 
-1. Download `photo_to_storybook_blender-1.0.0.zip` from the release.
+1. Download `photo_to_storybook_blender-1.0.1.zip` from the release.
 2. In Blender, open **Edit → Preferences → Add-ons → Install from Disk**, select the ZIP, and enable **Photo to Storybook 3D**.
 3. Open the 3D viewport’s **N sidebar → Storybook**.
 4. Select a photo and save folder, adjust the presets, and click **Create Storybook Character**.
@@ -21,10 +21,10 @@ Alternatively, download `photo_to_storybook.py` and run it from Blender’s Text
 
 ### Command line
 
-Install the wheel downloaded from a release:
+Install directly from PyPI:
 
 ```sh
-python -m pip install photo_to_storybook-1.0.0-py3-none-any.whl
+python -m pip install photo-to-storybook
 photo-to-storybook doctor
 photo-to-storybook generate --image person.jpg --output results
 ```

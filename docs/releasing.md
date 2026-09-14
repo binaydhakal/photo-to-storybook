@@ -10,13 +10,19 @@
 
 The manual **Build release downloads** workflow builds downloadable artifacts. It does not upload to PyPI or change repository visibility.
 
-## Optional public package registry
+## PyPI
 
-The artifacts are standard Python distributions suitable for a package registry, but they are not automatically published. A private GitHub release is only accessible to authorized repository readers.
+The package is distributed publicly as `photo-to-storybook`. Publishing is explicit; the GitHub build workflow does not upload to PyPI automatically.
 
-To publish on PyPI, the maintainer needs the package name, a PyPI account, and publishing authorization. Configure a scoped token or PyPI Trusted Publishing using the official instructions. Build and validate the distribution before running a registry upload. Do not put credentials in source files or commits.
+Use an authorized PyPI account and a configured token or Trusted Publisher. Build a new version, validate only that version's wheel and source distribution, then upload both:
 
-After a successful public publication, update the README installation command and distribution status. Public wheels/source distributions make their included source and assets downloadable even if GitHub remains private.
+```sh
+python -m twine upload --repository pypi dist/photo_to_storybook-VERSION-py3-none-any.whl dist/photo_to_storybook-VERSION.tar.gz
+```
+
+Substitute the new version. PyPI does not permit replacing an uploaded filename; publish a new version for corrections. Verify the public project page and install the published package into a clean environment before announcing a release. Attach the same version's files to GitHub Releases.
+
+Keep credentials outside source control. The repository does not contain PyPI tokens.
 
 References:
 - https://packaging.python.org/en/latest/tutorials/packaging-projects/

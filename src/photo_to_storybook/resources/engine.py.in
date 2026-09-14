@@ -14,7 +14,7 @@ Embedded MakeHuman asset data: CC0 1.0, MakeHuman Community.
 https://github.com/makehumancommunity/makehuman/blob/master/LICENSE.ASSETS.md
 Script code: MIT license. No affiliation with Studio Ghibli.
 """
-bl_info = {'name':'Photo to Storybook 3D','author':'Photo to Storybook contributors','version':(1,0,0),
+bl_info = {'name':'Photo to Storybook 3D','author':'Photo to Storybook contributors','version':(1,0,1),
  'blender':(4,2,0),'location':'3D View > Sidebar > Storybook',
  'description':'Photo-guided, editable storybook/anime character generator','category':'Object'}
 import bpy, math, json, random, pathlib, bmesh, sys, argparse, subprocess
@@ -717,7 +717,7 @@ def build_character(CFG,ANALYSIS,IMAGE,OUT,MH):
  name=CFG['name'] or (IMAGE.stem+'_storybook')
  native=OUT/(name+'.blend');exchange=OUT/(name+'.glb')
  packed=bpy.data.objects.new('Reference • input image (hidden)',None);source.objects.link(packed);packed.empty_display_type='IMAGE';packed.data=ref;packed.location=(-1.2,.4,1);packed.rotation_euler=(pi/2,0,0);packed.hide_render=True;packed.hide_set(True)
- notes={'generator':'Photo to Storybook 3D 1.0','input':IMAGE.name,'config':CFG,'analysis':ANALYSIS,
+ notes={'generator':'Photo to Storybook 3D 1.0.1','input':IMAGE.name,'config':CFG,'analysis':ANALYSIS,
  'limitations':['Approximate parametric character, not photogrammetry.','Fixed adult standing pose; proportions, clothing and hidden surfaces are inferred.','No animation rig; single photo cannot recover unseen geometry.','Hair, beard and accessories are presets, not automatic semantic reconstruction.']}
  (OUT/(name+'_settings.json')).write_text(json.dumps(notes,indent=2))
  txt=bpy.data.texts.new('READ ME • generation notes');txt.write(json.dumps(notes,indent=2))

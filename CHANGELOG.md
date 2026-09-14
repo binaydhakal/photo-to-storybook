@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.0.1
+
+- Public GitHub repository and release downloads.
+- First PyPI distribution with direct `pip install photo-to-storybook` installation.
+- Updated installation and publishing documentation.
+
 ## 1.0.0
 
 First packaged release of the photo-guided Blender generator.
